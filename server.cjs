@@ -1,29 +1,63 @@
+// server.cjs (CommonJS)
+const http = require("http");
 const WebSocket = require("ws");
-const wss = new WebSocket.Server({ port: 3001 });
+
+const port = Number(process.env.PORT || 3001);
+
+// 1) HTTP 서버 (EB/ALB 헬스체크용)
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+
+  // 기본 루트도 200으로 두면 안정적
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("signaling-ok");
+});
+
+// 2) 같은 포트에서 WebSocket 업그레이드 처리
+const wss = new WebSocket.Server({ server });
 
 // 방 구조: { roomId: Set of sockets }
 const rooms = new Map();
 
+function safeJsonParse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
 wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
-    const msg = JSON.parse(raw);
+    const msg = safeJsonParse(raw);
+    if (!msg || typeof msg !== "object") return;
+
     const { type, roomId, sender } = msg;
 
     if (type === "join-room") {
+      if (!roomId || !sender) return;
+
       if (!rooms.has(roomId)) rooms.set(roomId, new Set());
       rooms.get(roomId).add(ws);
+
       ws.roomId = roomId;
       ws.clientId = sender;
+
       console.log(`👥 Client ${sender} joined room ${roomId}`);
 
       // 같은 방의 기존 클라이언트에게 "새 피어 등장" 알림
       rooms.get(roomId).forEach((client) => {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({
-            type: "new-peer",
-            roomId,
-            sender
-          }));
+          client.send(
+            JSON.stringify({
+              type: "new-peer",
+              roomId,
+              sender,
+            })
+          );
         }
       });
       return;
@@ -41,12 +75,30 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     if (ws.roomId && rooms.has(ws.roomId)) {
-      rooms.get(ws.roomId).delete(ws);
-      if (rooms.get(ws.roomId).size === 0) {
-        rooms.delete(ws.roomId);
-      }
+      const roomId = ws.roomId;
+      const sender = ws.clientId;
+
+      rooms.get(roomId).delete(ws);
+
+      // (옵션) 나갔다고 알림
+      rooms.get(roomId).forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(
+            JSON.stringify({
+              type: "peer-left",
+              roomId,
+              sender,
+            })
+          );
+        }
+      });
+
+      if (rooms.get(roomId).size === 0) rooms.delete(roomId);
     }
   });
 });
 
-console.log("🚀 Signaling server running ws://localhost:3001");
+// 3) EB/컨테이너 환경에서 외부 접속 받으려면 0.0.0.0 권장
+server.listen(port, "0.0.0.0", () => {
+  console.log(`🚀 Signaling server running on :${port} (health: /health)`);
+});
